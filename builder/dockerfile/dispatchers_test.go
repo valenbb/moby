@@ -7,12 +7,14 @@ import (
 
 	"bytes"
 	"context"
+
 	"github.com/docker/docker/api/types"
 	"github.com/docker/docker/api/types/backend"
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/strslice"
 	"github.com/docker/docker/builder"
 	"github.com/docker/docker/builder/dockerfile/parser"
+	"github.com/docker/docker/pkg/system"
 	"github.com/docker/docker/pkg/testutil"
 	"github.com/docker/go-connections/nat"
 	"github.com/stretchr/testify/assert"
@@ -47,16 +49,23 @@ func defaultDispatchReq(builder *Builder, args ...string) dispatchRequest {
 }
 
 func newBuilderWithMockBackend() *Builder {
+	mockBackend := &MockBackend{}
+	ctx := context.Background()
 	b := &Builder{
 		options:       &types.ImageBuildOptions{},
-		docker:        &MockBackend{},
+		docker:        mockBackend,
 		buildArgs:     newBuildArgs(make(map[string]*string)),
-		tmpContainers: make(map[string]struct{}),
 		Stdout:        new(bytes.Buffer),
-		clientCtx:     context.Background(),
+		clientCtx:     ctx,
 		disableCommit: true,
+		imageSources: newImageSources(ctx, builderOptions{
+			Options: &types.ImageBuildOptions{},
+			Backend: mockBackend,
+		}),
+		buildStages:      newBuildStages(),
+		imageProber:      newImageProber(mockBackend, nil, false),
+		containerManager: newContainerManager(mockBackend),
 	}
-	b.imageContexts = &imageContexts{b: b}
 	return b
 }
 
@@ -191,19 +200,20 @@ func TestFromScratch(t *testing.T) {
 	}
 
 	require.NoError(t, err)
+	assert.True(t, req.state.hasFromImage())
 	assert.Equal(t, "", req.state.imageID)
-	assert.Equal(t, true, req.state.noBaseImage)
+	assert.Equal(t, []string{"PATH=" + system.DefaultPathEnv}, req.state.runConfig.Env)
 }
 
 func TestFromWithArg(t *testing.T) {
 	tag, expected := ":sometag", "expectedthisid"
 
-	getImage := func(name string) (builder.Image, error) {
+	getImage := func(name string) (builder.Image, builder.ReleaseableLayer, error) {
 		assert.Equal(t, "alpine"+tag, name)
-		return &mockImage{id: "expectedthisid"}, nil
+		return &mockImage{id: "expectedthisid"}, nil, nil
 	}
 	b := newBuilderWithMockBackend()
-	b.docker.(*MockBackend).getImageOnBuildFunc = getImage
+	b.docker.(*MockBackend).getImageFunc = getImage
 
 	require.NoError(t, arg(defaultDispatchReq(b, "THETAG="+tag)))
 	req := defaultDispatchReq(b, "alpine${THETAG}")
@@ -219,18 +229,33 @@ func TestFromWithArg(t *testing.T) {
 func TestFromWithUndefinedArg(t *testing.T) {
 	tag, expected := "sometag", "expectedthisid"
 
-	getImage := func(name string) (builder.Image, error) {
+	getImage := func(name string) (builder.Image, builder.ReleaseableLayer, error) {
 		assert.Equal(t, "alpine", name)
-		return &mockImage{id: "expectedthisid"}, nil
+		return &mockImage{id: "expectedthisid"}, nil, nil
 	}
 	b := newBuilderWithMockBackend()
-	b.docker.(*MockBackend).getImageOnBuildFunc = getImage
+	b.docker.(*MockBackend).getImageFunc = getImage
 	b.options.BuildArgs = map[string]*string{"THETAG": &tag}
 
 	req := defaultDispatchReq(b, "alpine${THETAG}")
 	err := from(req)
 	require.NoError(t, err)
 	assert.Equal(t, expected, req.state.imageID)
+}
+
+func TestFromMultiStageWithScratchNamedStage(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Windows does not support scratch")
+	}
+	b := newBuilderWithMockBackend()
+	req := defaultDispatchReq(b, "scratch", "AS", "base")
+
+	require.NoError(t, from(req))
+	assert.True(t, req.state.hasFromImage())
+
+	req.args = []string{"base"}
+	require.NoError(t, from(req))
+	assert.True(t, req.state.hasFromImage())
 }
 
 func TestOnbuildIllegalTriggers(t *testing.T) {
@@ -456,12 +481,17 @@ func TestRunWithBuildArgs(t *testing.T) {
 			return "", nil
 		},
 	}
-	b.imageCache = imageCache
 
 	mockBackend := b.docker.(*MockBackend)
-	mockBackend.getImageOnBuildImage = &mockImage{
-		id:     "abcdef",
-		config: &container.Config{Cmd: origCmd},
+	mockBackend.makeImageCacheFunc = func(_ []string) builder.ImageCache {
+		return imageCache
+	}
+	b.imageProber = newImageProber(mockBackend, nil, false)
+	mockBackend.getImageFunc = func(_ string) (builder.Image, builder.ReleaseableLayer, error) {
+		return &mockImage{
+			id:     "abcdef",
+			config: &container.Config{Cmd: origCmd},
+		}, nil, nil
 	}
 	mockBackend.containerCreateFunc = func(config types.ContainerCreateConfig) (container.ContainerCreateCreatedBody, error) {
 		// Check the runConfig.Cmd sent to create()

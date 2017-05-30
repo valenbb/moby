@@ -28,6 +28,7 @@ import (
 	"github.com/docker/docker/builder"
 	"github.com/docker/docker/builder/dockerfile/command"
 	"github.com/docker/docker/builder/dockerfile/parser"
+	"github.com/docker/docker/pkg/system"
 	"github.com/docker/docker/runconfig/opts"
 	"github.com/pkg/errors"
 )
@@ -67,6 +68,7 @@ type dispatchRequest struct {
 	original   string
 	shlex      *ShellLex
 	state      *dispatchState
+	source     builder.Source
 }
 
 func newDispatchRequestFromOptions(options dispatchOptions, builder *Builder, args []string) dispatchRequest {
@@ -78,6 +80,7 @@ func newDispatchRequestFromOptions(options dispatchOptions, builder *Builder, ar
 		flags:      NewBFlagsWithArgs(options.node.Flags),
 		shlex:      options.shlex,
 		state:      options.state,
+		source:     options.source,
 	}
 }
 
@@ -134,6 +137,7 @@ func (b *Builder) dispatch(options dispatchOptions) (*dispatchState, error) {
 	// To ensure the user is given a decent error message if the platform
 	// on which the daemon is running does not support a builder command.
 	if err := platformSupports(strings.ToLower(cmd)); err != nil {
+		buildsFailed.WithValues(metricsCommandNotSupportedError).Inc()
 		return nil, err
 	}
 
@@ -155,6 +159,7 @@ func (b *Builder) dispatch(options dispatchOptions) (*dispatchState, error) {
 	processFunc := createProcessWordFunc(options.shlex, cmd, envs)
 	words, err := getDispatchArgsFromNode(ast, processFunc, msg)
 	if err != nil {
+		buildsFailed.WithValues(metricsErrorProcessingCommandsError).Inc()
 		return nil, err
 	}
 	args = append(args, words...)
@@ -163,6 +168,7 @@ func (b *Builder) dispatch(options dispatchOptions) (*dispatchState, error) {
 
 	f, ok := evaluateTable[cmd]
 	if !ok {
+		buildsFailed.WithValues(metricsUnknownInstructionError).Inc()
 		return nil, fmt.Errorf("unknown instruction: %s", upperCasedCmd)
 	}
 	if err := f(newDispatchRequestFromOptions(options, b, args)); err != nil {
@@ -177,41 +183,62 @@ type dispatchOptions struct {
 	stepMsg string
 	node    *parser.Node
 	shlex   *ShellLex
+	source  builder.Source
 }
 
 // dispatchState is a data object which is modified by dispatchers
 type dispatchState struct {
-	runConfig   *container.Config
-	maintainer  string
-	cmdSet      bool
-	noBaseImage bool
-	imageID     string
-	baseImage   builder.Image
-	stageName   string
+	runConfig  *container.Config
+	maintainer string
+	cmdSet     bool
+	imageID    string
+	baseImage  builder.Image
+	stageName  string
 }
 
 func newDispatchState() *dispatchState {
 	return &dispatchState{runConfig: &container.Config{}}
 }
 
-func (r *dispatchState) updateRunConfig() {
-	r.runConfig.Image = r.imageID
+func (s *dispatchState) updateRunConfig() {
+	s.runConfig.Image = s.imageID
 }
 
 // hasFromImage returns true if the builder has processed a `FROM <image>` line
-func (r *dispatchState) hasFromImage() bool {
-	return r.imageID != "" || r.noBaseImage
+func (s *dispatchState) hasFromImage() bool {
+	return s.imageID != "" || (s.baseImage != nil && s.baseImage.ImageID() == "")
 }
 
-func (r *dispatchState) runConfigEnvMapping() map[string]string {
-	return opts.ConvertKVStringsToMap(r.runConfig.Env)
-}
-
-func (r *dispatchState) isCurrentStage(target string) bool {
+func (s *dispatchState) isCurrentStage(target string) bool {
 	if target == "" {
 		return false
 	}
-	return strings.EqualFold(r.stageName, target)
+	return strings.EqualFold(s.stageName, target)
+}
+
+func (s *dispatchState) beginStage(stageName string, image builder.Image) {
+	s.stageName = stageName
+	s.imageID = image.ImageID()
+
+	if image.RunConfig() != nil {
+		s.runConfig = image.RunConfig()
+	} else {
+		s.runConfig = &container.Config{}
+	}
+	s.baseImage = image
+	s.setDefaultPath()
+}
+
+// Add the default PATH to runConfig.ENV if one exists for the platform and there
+// is no PATH set. Note that windows won't have one as it's set by HCS
+func (s *dispatchState) setDefaultPath() {
+	if system.DefaultPathEnv == "" {
+		return
+	}
+	envMap := opts.ConvertKVStringsToMap(s.runConfig.Env)
+	if _, ok := envMap["PATH"]; !ok {
+		s.runConfig.Env = append(s.runConfig.Env, "PATH="+system.DefaultPathEnv)
+	}
 }
 
 func handleOnBuildNode(ast *parser.Node, msg *bytes.Buffer) (*parser.Node, []string, error) {
@@ -283,6 +310,7 @@ func checkDispatch(ast *parser.Node) error {
 	// least one argument
 	if upperCasedCmd == "ONBUILD" {
 		if ast.Next == nil {
+			buildsFailed.WithValues(metricsMissingOnbuildArgumentsError).Inc()
 			return errors.New("ONBUILD requires at least one argument")
 		}
 	}
@@ -290,6 +318,6 @@ func checkDispatch(ast *parser.Node) error {
 	if _, ok := evaluateTable[cmd]; ok {
 		return nil
 	}
-
+	buildsFailed.WithValues(metricsUnknownInstructionError).Inc()
 	return errors.Errorf("unknown instruction: %s", upperCasedCmd)
 }
